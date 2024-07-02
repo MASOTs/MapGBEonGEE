@@ -1,0 +1,446 @@
+//=====================================================================================================================
+
+// Land cover classification and accuracy assessment for vegetation and non-vegetation areas
+                                              
+
+//=====================================================================================================================
+
+//This script does the following:
+// * Ingest Sentinel 2 image for 2018
+// * Apply filters, masks and processes indices to compile all in a data-stack
+// * Performs a random forest classification with assessment of training accuracy
+// * Post-classification clean-up
+// * Exports results as assets and to the google drive
+
+//=====================================================================================================================
+
+///////////////////////////////////////////////////////////////
+//  * Map configuration                                       //
+///////////////////////////////////////////////////////////////
+
+Map.setCenter(-8.028, 39.92, 7);
+Map.setOptions('satellite');
+
+// Visualization parameters
+//**************************************************************************
+var rgbVis = {
+  min: 0.0,
+  max: 3000,
+  bands: ['B4', 'B3', 'B2'],
+};
+
+var ndviVis = {
+  min:0.5, 
+  max:1,
+  bands: ['ndvi'],
+  palette: ['white', 'green']
+};
+
+var visParamsROI = {
+  'color': 'red'};
+
+//Filter the ROI
+var ROI = baciasHidro.filter(ee.Filter.eq('WS_ID', 'PTRH1'))
+
+Map.addLayer(ROI, visParamsROI, 'ROI')
+
+
+
+///////////////////////////////////////////////////////////////
+//  * Sentinel-2 composite preparation for 2018              //
+///////////////////////////////////////////////////////////////
+
+
+// Function to remove pixels with clouds and snow from Sentinel-2 SR images
+//**************************************************************************
+function maskCloudAndShadowsSR(image) {
+  var cloudProb = image.select('MSK_CLDPRB');
+  var snowProb = image.select('MSK_SNWPRB');
+  var cloud = cloudProb.lt(10);
+  var scl = image.select('SCL'); 
+  var shadow = scl.eq(3); 
+  var cirrus = scl.eq(10); 
+  var mask = cloud.and(cirrus.neq(1)).and(shadow.neq(1));
+  return image.updateMask(mask);
+}
+
+
+// Applying filters to Sentinel-2 SR images for 2018
+//**************************************************************************
+var filtered = s2
+.filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 10)) 
+  .filter(ee.Filter.date('2018-01-01', '2019-01-01')) 
+  .filter(ee.Filter.bounds(ROI)) 
+  .map(maskCloudAndShadowsSR) 
+  .select('B.*'); 
+
+var composite2018 = filtered.median().clip(ROI);
+
+//print(filtered.size())
+
+//Map.addLayer(composite2018, rgbVis, 'Composite 2018'); //Composito RGB para 2018
+
+// Calculation and application of spectral indices
+//************************************************************************** 
+// 'NIR' (B8) and 'RED' (B4)
+var ndvi = composite2018.normalizedDifference(['B8', 'B4']).rename(['ndvi']);
+
+var ndvi2018 = ndvi.clip(ROI)
+
+// Create a mask for areas with NDVI > 0.1
+var ndviMask = ndvi2018.gt(0.1);
+
+// Apply the NDVI mask to the composite image
+var composited = composite2018.updateMask(ndviMask);
+
+// Display the NDVI-masked composite
+Map.addLayer(composited, rgbVis, 'NDVI Masked Composite 2018');
+
+// Display the NDVI mask
+//Map.addLayer(ndviMask, {palette: ['00FF00']}, 'NDVI Mask');
+
+
+// Calculation of slope and elevation
+//************************************************************************** 
+var elev = alos.select('AVE_DSM').rename('elev');
+var slope = ee.Terrain.slope(alos.select('AVE_DSM')).rename('slope');
+
+var dataStack = composited.addBands(elev).addBands(slope);
+
+//print (dataStack, 'Data-stack 2018');
+
+Map.addLayer(composited, rgbVis, 'RGB');
+
+
+// Function to normalize image data. 
+//************************************************************************** 
+function normalize(image){
+  var bandNames = image.bandNames();
+  
+  var minDict = image.reduceRegion({
+    reducer: ee.Reducer.min(),
+    geometry: ROI,
+    scale: 10,
+    maxPixels: 1e9,
+    bestEffort: true,
+    tileScale: 16
+  });
+  var maxDict = image.reduceRegion({
+    reducer: ee.Reducer.max(),
+    geometry: ROI,
+    scale: 10,
+    maxPixels: 1e9,
+    bestEffort: true,
+    tileScale: 16
+  });
+  var mins = ee.Image.constant(minDict.values(bandNames));
+  var maxs = ee.Image.constant(maxDict.values(bandNames));
+
+  var normalized = image.subtract(mins).divide(maxs.subtract(mins));
+  return normalized;
+}
+
+var dataStackNorm = normalize(dataStack);
+
+//print (dataStackNorm, 'Data-stack Normalized 2018')
+
+
+
+///////////////////////////////////////////////////////////////
+//  * Data preparation for classification                    //
+///////////////////////////////////////////////////////////////
+
+print (dataStackNorm.bandNames())
+
+// Bands included in the model
+//**************************************************************************
+var bands = ['B2','B3','B4','B5','B6','B7','B8','B8A','B11','B12',
+'ndvi','savi', 'evi',
+'elev','slope']
+
+// Selection of bands of interest and clip to geometry
+//**************************************************************************
+var image = dataStackNorm.select(bands).clip(ROI)
+//print (image)
+
+// Add a random column
+//**************************************************************************
+var gcpsPoints = gcps.randomColumn();
+//print (gcpsPoints)
+
+// Randomly divide the samples (70% training data, 30% validation) 
+//**************************************************************************
+var trainingGcp = gcpsPoints.filter(ee.Filter.lt('random', 0.7)); 
+var validationGcp = gcpsPoints.filter(ee.Filter.gte('random', 0.7));
+
+// Variable printing
+//**************************************************************************
+print (trainingGcp)
+print (validationGcp)
+
+// Sample assembly to run the model
+//************************************************************************** 
+var training = dataStackNorm.sampleRegions({
+  collection: trainingGcp, 
+  properties: ['landcover'], 
+  scale: 10,
+  tileScale: 16
+});
+
+print(training)
+
+
+///////////////////////////////////////////////////////////////
+// * Random Forest Model                                     //
+///////////////////////////////////////////////////////////////
+
+// Trainning of the RFM algorithm
+//**************************************************************************
+var classifierRF = ee.Classifier.smileRandomForest(100,3)
+.train({
+  features: training,  
+  classProperty: 'landcover',
+  inputProperties: bands
+});
+
+// Image classification
+//**************************************************************************
+var classified = dataStackNorm.classify(classifierRF);
+
+Map.addLayer(classified.clip(ROI), {min: 0, max: 1, 
+              palette: ['gray', 'green']}, 
+              'RF classified 2018');
+
+// Evaluation of model accuracy
+//**************************************************************************
+var test = classified.sampleRegions({
+  collection: validationGcp,
+  properties: ['landcover'],
+  scale: 10,
+  tileScale: 16
+});
+
+var confusionMatrix = test.errorMatrix('landcover', 'classification');
+
+print('Confusion Matrix RF 2018', confusionMatrix);
+print('Test Accuracy RF 2018:', confusionMatrix.accuracy());
+
+// Evaluation metrics calculation
+//**************************************************************************
+print('Producers Accuracy RF 2018:', confusionMatrix.producersAccuracy());
+print('Consumers Accuracy RF 2018:', confusionMatrix.consumersAccuracy());
+print('Kappa RF 2018:', confusionMatrix.kappa());
+print('F1 score RF 2018:', confusionMatrix.fscore());
+
+// Create a feature with all the metrics
+var fc = ee.FeatureCollection([
+  ee.Feature(null, {
+    'Confusion Matrix RF': confusionMatrix.accuracy(),
+    'Test Accuracy RF': confusionMatrix.array(),
+    'Producers Accuracy RF': confusionMatrix.producersAccuracy(),
+    'Consumers Accuracy RF': confusionMatrix.consumersAccuracy(),
+    'Kappa RF': confusionMatrix.kappa(),
+    'F1 score RF 2018:': confusionMatrix.fscore()
+    })
+]);
+
+// Accuracy evaluation results export as CSV
+//**************************************************************************
+var fc = ee.FeatureCollection([
+  ee.Feature(null, {
+    'Confusion Matrix RF': confusionMatrix.accuracy(),
+    'Test Accuracy RF': confusionMatrix.array()
+  })
+  ]);
+
+Export.table.toDrive({
+  collection: fc,
+  description: 'Accuracy_Export',
+  folder: 'earthEngine',
+  fileNamePrefix: 'accuracy',
+  fileFormat: 'CSV'
+})
+
+
+
+//************************************************************************** 
+// Post process by clustering
+//**************************************************************************
+
+// Cluster using Unsupervised Clustering methods
+//************************************************************************** 
+var seeds = ee.Algorithms.Image.Segmentation.seedGrid(5);
+
+var snic = ee.Algorithms.Image.Segmentation.SNIC({
+  image: image, 
+  compactness: 0,
+  connectivity: 4,
+  neighborhoodSize: 10,
+  size: 2,
+  seeds: seeds
+})
+var clusters = snic.select('clusters')
+
+var smoothed = classified.addBands(clusters);
+
+var clusterMajority = smoothed.reduceConnectedComponents({
+  reducer: ee.Reducer.mode(),
+  labelBand: 'clusters'
+});
+
+Map.addLayer(clusterMajority, {min: 0, max: 1, 
+              palette: ['gray', 'green']},
+              'Processed using Clusters');
+
+
+
+//************************************************************************** 
+// Post process by replacing isolated pixels with surrounding value
+//************************************************************************** 
+
+var patchsize = clusterMajority.connectedPixelCount(40, false);
+
+var filtered = clusterMajority.focal_mode({
+    radius: 10,
+    kernelType: 'square',
+    units: 'meters',
+}); 
+  
+var connectedClassified =  clusterMajority.where(patchsize.lt(25),filtered);
+
+Map.addLayer(connectedClassified, {min: 0, max: 1, 
+              palette: ['gray', 'green']},
+              'Processed using Connected Pixels');
+
+
+
+//************************************************************************** 
+// Classification results export
+//**************************************************************************
+
+//export as asset
+Export.image.toAsset({
+  image: connectedClassified,
+  description: 'S2_2018_foresNonForest_1aClassificacao_1ToM',
+  assetId: 'S2_2018_foresNonForest_1aClassificacao_1ToM',
+  region: ROI,
+  scale: 10,
+  maxPixels: 1e13,
+  });
+
+
+//export to G.Drive
+Export.image.toDrive({
+  image: connectedClassified,
+  description: 'S2_2018_foresNonForest_classification_PT',
+  region: ROI,
+  scale: 10,
+  maxPixels: 1e13,
+  crs: 'EPSG:3763',
+  });
+
+
+
+//************************************************************************** 
+// Feature Importance
+//************************************************************************** 
+
+//print(classified.explain())
+
+var importance = ee.Dictionary(classifierRF.explain().get('importance'))
+
+var sum = importance.values().reduce(ee.Reducer.sum())
+
+var relativeImportance = importance.map(function(key, val) {
+   return (ee.Number(val).multiply(100)).divide(sum)
+  })
+print(relativeImportance)
+
+var importanceFc = ee.FeatureCollection([
+  ee.Feature(null, relativeImportance)
+])
+
+var chart = ui.Chart.feature.byProperty({
+  features: importanceFc
+}).setOptions({
+      title: 'Feature Importance',
+      vAxis: {title: 'Importance'},
+      hAxis: {title: 'Feature'}
+  })
+print(chart)
+
+
+
+//************************************************************************** 
+// Hyperparameter Tuning
+//************************************************************************** 
+
+var test = dataStackNorm.sampleRegions({
+  collection: validationGcp,
+  properties: ['landcover'],
+  scale: 10,
+  tileScale: 16
+});
+
+var numTreesList = ee.List.sequence(10, 150, 10);
+
+var accuracies = numTreesList.map(function(numTrees) {
+  var classifier = ee.Classifier.smileRandomForest(numTrees)
+      .train({
+        features: training,
+        classProperty: 'landcover',
+        inputProperties: dataStackNorm.bandNames()
+      });
+
+  
+  return test
+    .classify(classifier)
+    .errorMatrix('landcover', 'classification')
+    .accuracy();
+});
+
+var chart = ui.Chart.array.values({
+  array: ee.Array(accuracies),
+  axis: 0,
+  xLabels: numTreesList
+  }).setOptions({
+      title: 'Hyperparameter Tuning for the numberOfTrees Parameters',
+      vAxis: {title: 'Validation Accuracy'},
+      hAxis: {title: 'Number of Tress', gridlines: {count: 15}}
+  });
+print(chart)
+
+var numTreesList = ee.List.sequence(10, 150, 10);
+var bagFractionList = ee.List.sequence(0.1, 0.9, 0.1);
+
+var accuracies = numTreesList.map(function(numTrees) {
+  return bagFractionList.map(function(bagFraction) {
+     var classifier = ee.Classifier.smileRandomForest({
+       numberOfTrees: numTrees,
+       bagFraction: bagFraction
+     })
+      .train({
+        features: training,
+        classProperty: 'landcover',
+        inputProperties: dataStackNorm.bandNames()
+      });
+
+    var accuracy = test
+      .classify(classifier)
+      .errorMatrix('landcover', 'classification')
+      .accuracy();
+    return ee.Feature(null, {'accuracy': accuracy,
+      'numberOfTrees': numTrees,
+      'bagFraction': bagFraction})
+  })
+}).flatten()
+var resultFc = ee.FeatureCollection(accuracies)
+
+
+// Export the result as CSV to G.Drive
+Export.table.toDrive({
+  collection: resultFc,
+  description: 'Multiple_Parameter_Tuning_Results',
+  folder: 'earthEngine',
+  fileNamePrefix: 'numtrees_bagfraction',
+  fileFormat: 'CSV'}) 
